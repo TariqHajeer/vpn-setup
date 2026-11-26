@@ -51,3 +51,7 @@ Tested on Fedora 42.
 
 WireGuard `.conf` files and NetworkManager connection files contain **private keys**.
 They live in `/etc/wireguard` and `/etc/NetworkManager`, never in this repository.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
