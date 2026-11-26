@@ -363,23 +363,25 @@ journalctl -u vpn-dns -b                    # private DNS server log
 
 ## 7. Emergencies
 
-**"My VPN is gone and I need ChatGPT, Claude or Telegram now."**
+**"My VPN is gone and I need ChatGPT or Claude now."**
 ```bash
 vpn killswitch off
 ```
 They work immediately over your normal connection. The top bar shows **⚠ kill switch off** until you run `vpn killswitch on`. This works offline; it only needs your sudo password.
 
-**"Lookups for listed sites fail even with the VPN on"** (e.g. vpn-dns crashed). This command removes just the DNS steering, so every name is looked up normally:
+**"Lookups for listed sites fail even with the VPN on"** (e.g. vpn-dns crashed). These commands remove just the DNS steering, so every name is looked up normally:
 ```bash
 sudo rm /etc/systemd/resolved.conf.d/vpn.conf
-sudo systemctl reload-or-restart systemd-resolved
+sudo systemctl restart systemd-resolved
+sudo nmcli general reload dns-full      # NetworkManager re-sends the VPN's DNS settings
 ```
-The next `vpn apply` (or `vpn killswitch on`) puts it back, so fix the cause first (see 8).
+Use `restart`, not `reload`. A reload doesn't forget domains (11.12). The next `vpn apply` (or `vpn killswitch on`) puts the steering back, so fix the cause first (see 8).
 
 **"Turn the whole thing off for now":**
 ```bash
 sudo rm -f /etc/systemd/resolved.conf.d/vpn.conf
-sudo systemctl reload-or-restart systemd-resolved
+sudo systemctl restart systemd-resolved
+sudo nmcli general reload dns-full
 sudo systemctl stop vpn-firewall        # also stops vpn-dns; no bypass, no kill switch
 ```
 Back on: `sudo systemctl start vpn-firewall vpn-dns && vpn apply`. A reboot also brings it back.
@@ -418,14 +420,21 @@ It probably shares an IP address with a listed site (common with Cloudflare, see
 - Browsers keep open connections and cached lookups for a short while. After `vpn apply`, reload the page or restart the browser.
 - If the browser uses its own secure DNS, it skips vpn-dns completely (11.9).
 
-### 8.7 The top bar shows nothing
+### 8.7 A site stops working right after you removed it from a list
+`resolvectl query <site>` says `REFUSED`. The resolver is still sending that name to vpn-dns, which no longer knows it. Check:
+```bash
+busctl get-property org.freedesktop.resolve1 /org/freedesktop/resolve1 org.freedesktop.resolve1.Manager Domains
+```
+If the removed domain is still listed, the resolver kept it from before (11.12). Running `vpn apply` restarts the resolver and clears it. On an old copy of `vpn`, use `sudo systemctl restart systemd-resolved && sudo nmcli general reload dns-full`.
+
+### 8.8 The top bar shows nothing
 - `gnome-extensions info vpn-status@vpn-setup` should show `State: ACTIVE`. If it doesn't, log out and back in once.
 - Errors: `journalctl --user -b -o cat /usr/bin/gnome-shell | grep -i vpn-status`.
 
-### 8.8 `vpn apply` fails
+### 8.9 `vpn apply` fails
 It checks everything before changing anything. If the firewall rules wouldn't load, it says so and keeps the old ones. Read the message: usually a bad line in `/etc/vpn/vpn-only` or `/etc/vpn/vpns`. Use `vpn apply --dry-run` to see what it would generate.
 
-### 8.9 A service fails after copying files around
+### 8.10 A service fails after copying files around
 Copying a file with `mv` keeps its old SELinux label, and system services can then not read it ("Permission denied" even as root). Use `sudo install` (as the installer does), or fix the labels: `sudo restorecon -Rv /etc/vpn /etc/wireguard`. See 11.2.
 
 ---
@@ -536,7 +545,14 @@ The VPN offers IPv6, the home connection doesn't, and browsers prefer IPv6. A by
 ### 11.11 Moving Telegram from the kill switch to the bypass list
 At first Telegram was on the VPN-only list. Later the wish was the opposite: Telegram should never use the VPN. Its IP ranges work on either list, because the firewall acts on destinations, not on the app. That's why the bypass list takes IP ranges too, and why a Flatpak app needs no wrapper.
 
-### 11.12 The helper is behind the kill switch
+### 11.12 A resolver *reload* only ever adds domains
+Gmail was taken off the bypass list and `vpn apply` was run, and Gmail stopped working: `REFUSED`. The config file was right, but the resolver's live list still had `mail.google.com`, `gmail.com` and `accounts.google.com`. So it still sent them to vpn-dns, which no longer knew them.
+
+The cause: `systemctl reload systemd-resolved` re-reads the config and adds new routing domains, but never drops ones that were removed. It only showed up the first time something was *removed* from a list.
+
+**Fix:** `vpn apply` now **restarts** the resolver. A restart also forgets the DNS settings NetworkManager gave it for each connection, so it then runs `nmcli general reload dns-full` to have NetworkManager send them again. It also checks that every running internet VPN got its DNS server back.
+
+### 11.13 The helper is behind the kill switch
 Claude Code and claude.ai are on the VPN-only list. When the VPN is down, the AI assistant that helped build this can't be reached. Hence this offline manual, and `vpn killswitch off` as the way out.
 
 ---
