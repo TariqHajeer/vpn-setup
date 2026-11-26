@@ -1,0 +1,20 @@
+module vpn_dnsmasq 1.0;
+
+# Lets dnsmasq (vpn-dns.service) add the IPs of VPN-only domains to the nftables
+# sets in table "inet vpnsplit" (its nftset= option). Fedora's policy refuses
+# dnsmasq the netfilter netlink socket this needs, and vpn-dns then fails with
+# "Unable to initialize Netlink socket: Permission denied".
+#
+# install.sh compiles and loads it:
+#   checkmodule -M -m -o vpn_dnsmasq.mod vpn_dnsmasq.te
+#   semodule_package -o vpn_dnsmasq.pp -m vpn_dnsmasq.mod
+#   sudo semodule -i vpn_dnsmasq.pp
+
+require {
+    type dnsmasq_t;
+    class netlink_netfilter_socket { create bind getattr setopt getopt read write };
+    class capability net_admin;
+}
+
+allow dnsmasq_t self:netlink_netfilter_socket { create bind getattr setopt getopt read write };
+allow dnsmasq_t self:capability net_admin;

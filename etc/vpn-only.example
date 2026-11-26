@@ -1,0 +1,19 @@
+# /etc/vpn/vpn-only: things that must only work through a VPN (the kill switch).
+# After editing:  vpn apply          (manual: ~/vpn-setup/MANUAL.md)
+#
+# One entry per line:
+#   - a domain; it also covers all its subdomains        e.g. chatgpt.com
+#   - an IP or IP range, for apps with built-in addresses  e.g. 91.108.4.0/22
+# While no VPN is up (and the kill switch is on), these don't work at all.
+# Don't list huge shared domains (google.com, googleapis.com, cloudflare.com, amazonaws.com).
+
+# --- ChatGPT (site)
+chatgpt.com
+# ChatGPT also loads files from these; uncomment to cover them too.
+# oaistatic.com
+# oaiusercontent.com
+
+# --- Claude Code and claude.ai (app + site)
+anthropic.com
+claude.ai
+claude.com

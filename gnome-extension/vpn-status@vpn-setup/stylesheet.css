@@ -1,0 +1,8 @@
+.vpn-status-label {
+  padding: 0 4px;
+  font-weight: bold;
+}
+
+.vpn-status-warning {
+  color: #f6d32d;
+}

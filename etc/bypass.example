@@ -1,0 +1,52 @@
+# /etc/vpn/bypass: things that always skip the VPN and use the normal connection.
+# After editing:  vpn apply          (manual: ~/vpn-setup/MANUAL.md)
+#
+# One entry per line:
+#   - a domain; it also covers all its subdomains        e.g. youtube.com
+#   - an IP or IP range, for apps with built-in addresses  e.g. 91.108.4.0/22
+# Works for every program (browsers, Flatpak apps, curl). If something is on both
+# this list and /etc/vpn/vpn-only, the VPN-only list wins.
+# Don't list huge shared domains (google.com, googleapis.com, cloudflare.com, amazonaws.com).
+
+# --- YouTube (site + app)
+youtube.com
+youtu.be
+youtube-nocookie.com
+youtubei.googleapis.com
+googlevideo.com
+ytimg.com
+ggpht.com
+
+# --- Gmail
+# Google serves many of its sites from shared addresses, so some other Google traffic
+# may skip the VPN too. Sign-in is listed so Google sees you from one place only.
+mail.google.com
+gmail.com
+accounts.google.com
+
+# --- LinkedIn (site, its image/script server, short links)
+linkedin.com
+licdn.com
+lnkd.in
+
+# --- Telegram (app + site)
+# The app connects to built-in IPs, so its official ranges are listed too:
+# https://core.telegram.org/resources/cidr.txt (checked 2026-11-26)
+telegram.org
+telegram.me
+t.me
+telesco.pe
+91.108.56.0/22
+91.108.4.0/22
+91.108.8.0/22
+91.108.16.0/22
+91.108.12.0/22
+149.154.160.0/20
+91.105.192.0/23
+91.108.20.0/22
+185.76.151.0/24
+2001:b28:f23d::/48
+2001:b28:f23f::/48
+2001:67c:4e8::/48
+2001:b28:f23c::/48
+2a0a:f280::/32

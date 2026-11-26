@@ -1,0 +1,6 @@
+{
+  "uuid": "vpn-status@vpn-setup",
+  "name": "VPN Status",
+  "description": "Shows the names of the VPNs that are up in the top bar, and warns while the VPN kill switch is off.",
+  "shell-version": ["48", "49"]
+}

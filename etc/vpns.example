@@ -1,0 +1,29 @@
+# /etc/vpn/vpns: the WireGuard VPNs on this machine.
+# After editing:  vpn apply          (manual: ~/vpn-setup/MANUAL.md)
+#
+# One section per VPN. The [name] is what you see everywhere: the top bar, GNOME
+# Quick Settings, and commands like  vpn use "USA VPN".
+#
+#   file      = the WireGuard .conf file to import. It is read only the first time;
+#               after that NetworkManager keeps its own copy.
+#   type      = internet   all your traffic and DNS go through it. Only one is up at a
+#                          time; pick it with  vpn use "<name>"  (that one also starts
+#                          at boot).
+#               company    only the addresses in the file's AllowedIPs go through it;
+#                          your DNS and other traffic don't change.
+#   autostart = yes | no   company VPNs only: connect at boot (default: yes).
+
+[Dubai VPN]
+file = /etc/wireguard/proton-ae-21.conf
+type = internet
+
+[Work VPN]
+file = /etc/wireguard/work.conf
+type = company
+autostart = yes
+
+# Another server: get its WireGuard file, store it in /etc/wireguard, then uncomment,
+# run `vpn apply`, and switch with  vpn use "USA VPN".
+# [USA VPN]
+# file = /etc/wireguard/US-FREE-12.conf
+# type = internet

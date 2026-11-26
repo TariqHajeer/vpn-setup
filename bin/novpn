@@ -1,0 +1,25 @@
+#!/bin/bash
+# novpn / vpnonly: run a program with its network traffic controlled by group.
+#
+#   novpn   <command>   its traffic skips the VPN and goes out over the normal connection
+#   vpnonly <command>   its traffic may only leave through a VPN (blocked while none is up)
+#
+# Installed as /usr/local/bin/novpn, with /usr/local/bin/vpnonly a symlink to it. The group
+# is the name the script was called by. The firewall (/etc/vpn/firewall.nft) acts on that
+# group's packets. Examples:
+#   novpn curl -s https://ifconfig.me
+#   Steam launch option:  novpn %command%
+set -euo pipefail
+
+name=$(basename "$0")
+[ $# -gt 0 ] || { echo "usage: $name <command> [args...]" >&2; exit 2; }
+
+group=${NOVPN_GROUP:-$name}
+
+# `sg` switches group, but it is setuid, so the system strips LD_PRELOAD,
+# LD_LIBRARY_PATH, TMPDIR and similar variables on the way. Steam games need
+# them, so save the whole environment and restore it before running the program.
+envfile=$(mktemp "${XDG_RUNTIME_DIR:-/tmp}/$name-env.XXXXXX")
+export -p > "$envfile"
+printf -v cmd '%q ' "$@"
+exec sg "$group" -c "source $(printf %q "$envfile") 2>/dev/null; rm -f $(printf %q "$envfile"); exec $cmd"

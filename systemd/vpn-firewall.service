@@ -1,0 +1,16 @@
+[Unit]
+Description=VPN firewall: game bypass and kill switch (settings in /etc/vpn)
+Documentation=file:///etc/vpn/firewall.nft
+Wants=network-pre.target
+Before=network-pre.target NetworkManager.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/nft -f /etc/vpn/firewall.nft
+# Reloading empties the VPN-only IP sets; drop cached DNS answers so they refill.
+ExecStartPost=-/usr/bin/resolvectl flush-caches
+ExecStop=/usr/bin/nft delete table inet vpnsplit
+
+[Install]
+WantedBy=multi-user.target

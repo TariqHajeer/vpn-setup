@@ -1,0 +1,13 @@
+[Unit]
+Description=VPN DNS: looks up VPN-only domains only through the VPN (settings in /etc/vpn)
+Requires=vpn-firewall.service
+After=vpn-firewall.service
+PartOf=vpn-firewall.service
+ConditionPathExists=/etc/vpn/generated/dnsmasq.conf
+
+[Service]
+ExecStart=/usr/sbin/dnsmasq --keep-in-foreground --conf-file=/etc/vpn/generated/dnsmasq.conf
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

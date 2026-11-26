@@ -1,0 +1,12 @@
+# WireGuard configs contain private keys. Never commit them.
+*.conf
+
+# NetworkManager connection files (also contain keys)
+*.nmconnection
+
+# SELinux build output (install.sh builds these in a temp folder)
+*.mod
+*.pp
+
+# Python cache
+__pycache__/

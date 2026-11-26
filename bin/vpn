@@ -1,0 +1,577 @@
+#!/usr/bin/python3 -I
+"""vpn: manage this machine's WireGuard VPNs, the VPN kill switch and the game bypass.
+
+Settings live in /etc/vpn:
+  vpns            your VPNs: name, WireGuard file, type (internet or company)
+  vpn-only        domains and IP ranges that may only be reached through a VPN
+  bypass          domains and IP ranges that always skip the VPN
+  killswitch-off  exists while the kill switch is turned off
+
+Full documentation: ~/vpn-setup/MANUAL.md
+"""
+
+import argparse
+import configparser
+import ipaddress
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+ETC = os.environ.get("VPN_ETC", "/etc/vpn")  # the override is only for testing
+VPNS_FILE = os.path.join(ETC, "vpns")
+VPN_ONLY_FILE = os.path.join(ETC, "vpn-only")
+BYPASS_FILE = os.path.join(ETC, "bypass")
+KILLSWITCH_OFF_FLAG = os.path.join(ETC, "killswitch-off")
+FIREWALL_FILE = os.path.join(ETC, "firewall.nft")
+GEN_DIR = os.path.join(ETC, "generated")
+GEN_RULES = os.path.join(GEN_DIR, "rules.nft")
+GEN_DNSMASQ = os.path.join(GEN_DIR, "dnsmasq.conf")
+RESOLVED_DROPIN = "/etc/systemd/resolved.conf.d/vpn.conf"
+
+TABLE = "inet vpnsplit"           # the nftables table (see /etc/vpn/firewall.nft)
+DNSMASQ_ADDR = "127.0.0.2"        # where vpn-dns.service listens
+BYPASS_MARK = "0x6e76"            # packet mark for "skip the VPN" (novpn)
+BYPASS_RULE = f"priority 100 fwmark {BYPASS_MARK} table 254"   # marked packets use the main table
+BYPASS_DNS = ("1.1.1.1", "1.0.0.1")   # public DNS (Cloudflare) for bypass domains, asked directly
+MANUAL = "~/vpn-setup/MANUAL.md"
+TYPES = ("internet", "company")
+DOMAIN_RE = re.compile(r"^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$")
+
+# Kill-switch rules, added only while the kill switch is on. Traffic leaving through a
+# VPN interface is always fine; otherwise these destinations / apps are refused.
+KILLSWITCH_RULES = {
+    "killswitch_out": [
+        "oifname @vpn_ifaces accept",
+        "ip daddr @vpn_dns_v4 counter reject",
+        "ip6 daddr @vpn_dns_v6 counter reject",
+        "ip daddr @vpnonly_v4 counter reject",
+        "ip6 daddr @vpnonly_v6 counter reject",
+        "ip daddr @vpnonly_ranges_v4 counter reject",
+        "ip6 daddr @vpnonly_ranges_v6 counter reject",
+        "meta skgid vpnonly counter reject",
+    ],
+    "killswitch_fwd": [
+        "oifname @vpn_ifaces accept",
+        "ip daddr @vpnonly_v4 counter reject",
+        "ip6 daddr @vpnonly_v6 counter reject",
+        "ip daddr @vpnonly_ranges_v4 counter reject",
+        "ip6 daddr @vpnonly_ranges_v6 counter reject",
+    ],
+}
+
+
+# ---------------------------------------------------------------- helpers
+
+def die(msg):
+    print(f"vpn: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def warn(msg):
+    print(f"  ! {msg}")
+
+
+def run(cmd, check=True):
+    """Run a command and return its output. Stop with its error message if it fails."""
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if check and r.returncode != 0:
+        die(f"`{' '.join(cmd)}` failed: {(r.stderr or r.stdout).strip()}")
+    return r.stdout.strip()
+
+
+def become_root():
+    """Re-run this same command through sudo if we aren't root yet."""
+    if os.geteuid() != 0:
+        os.execvp("sudo", ["sudo", os.path.realpath(sys.argv[0])] + sys.argv[1:])
+    os.umask(0o022)
+
+
+def write(path, text):
+    with open(path, "w") as f:
+        f.write(text)
+
+
+# ---------------------------------------------------------------- your settings
+
+class Vpn:
+    def __init__(self, name, file, kind, autostart):
+        self.name, self.file, self.kind, self.autostart = name, file, kind, autostart
+
+
+def load_vpns():
+    if not os.path.exists(VPNS_FILE):
+        die(f"{VPNS_FILE} doesn't exist. See {MANUAL}.")
+    parser = configparser.ConfigParser(inline_comment_prefixes=("#", ";"), interpolation=None)
+    try:
+        parser.read(VPNS_FILE)
+    except configparser.Error as e:
+        die(f"{VPNS_FILE}: {e}")
+    vpns = []
+    for name in parser.sections():
+        sec = parser[name]
+        kind = sec.get("type", "internet").strip().lower()
+        if kind not in TYPES:
+            die(f'{VPNS_FILE}: [{name}] has "type = {kind}"; it must be internet or company')
+        try:
+            autostart = sec.getboolean("autostart", fallback=True)
+        except ValueError:
+            die(f'{VPNS_FILE}: [{name}] "autostart" must be yes or no')
+        vpns.append(Vpn(name, sec.get("file", "").strip(), kind, autostart))
+    return vpns
+
+
+def find_vpn(vpns, name):
+    for v in vpns:
+        if v.name == name:
+            return v
+    matches = [v for v in vpns if v.name.lower() == name.lower()]
+    if len(matches) == 1:
+        return matches[0]
+    known = ", ".join(f'"{v.name}"' for v in vpns) or "none"
+    die(f'there is no VPN called "{name}" in {VPNS_FILE} (known: {known})')
+
+
+def load_list(path):
+    """Read a domain / IP-range list. Returns (domains, IPv4 ranges, IPv6 ranges)."""
+    domains, v4, v6 = set(), set(), set()
+    if not os.path.exists(path):
+        return [], [], []
+    with open(path) as f:
+        for lineno, line in enumerate(f, 1):
+            entry = line.split("#", 1)[0].strip().lower().lstrip(".")
+            if not entry:
+                continue
+            try:
+                net = ipaddress.ip_network(entry, strict=False)
+                (v4 if net.version == 4 else v6).add(net)
+                continue
+            except ValueError:
+                pass
+            if DOMAIN_RE.match(entry):
+                domains.add(entry)
+            else:
+                warn(f"{path} line {lineno} is not a domain or IP range, skipped: {line.strip()}")
+    return sorted(domains), [str(n) for n in sorted(v4)], [str(n) for n in sorted(v6)]
+
+
+def killswitch_on():
+    return not os.path.exists(KILLSWITCH_OFF_FLAG)
+
+
+# ---------------------------------------------------------------- NetworkManager
+
+def split_terse(line):
+    """Split a line of `nmcli -t` output; it escapes ':' and '\\' inside values."""
+    fields, cur, escaped = [], "", False
+    for ch in line:
+        if escaped:
+            cur, escaped = cur + ch, False
+        elif ch == "\\":
+            escaped = True
+        elif ch == ":":
+            fields.append(cur)
+            cur = ""
+        else:
+            cur += ch
+    fields.append(cur)
+    return fields
+
+
+def nm_wireguard():
+    """{connection name: is it up} for every WireGuard connection NetworkManager knows."""
+    result = {}
+    for line in run(["nmcli", "-t", "-f", "NAME,TYPE,ACTIVE", "connection", "show"]).splitlines():
+        fields = split_terse(line)
+        if len(fields) == 3 and fields[1] == "wireguard":
+            result[fields[0]] = fields[2] == "yes"
+    return result
+
+
+def nm_get(name, field):
+    r = subprocess.run(["nmcli", "-e", "no", "-g", field, "connection", "show", "id", name],
+                       capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def interface_name_for(name, taken):
+    """A Linux interface name (max 15 characters) made from the VPN's name."""
+    base = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:15] or "wg"
+    candidate, n = base, 2
+    while candidate in taken:
+        suffix = f"-{n}"
+        candidate = base[: 15 - len(suffix)] + suffix
+        n += 1
+    return candidate
+
+
+def import_vpn(v, taken):
+    """Import a VPN's WireGuard file into NetworkManager, switched off. True on success."""
+    if not v.file:
+        warn(f'{v.name}: has no "file =" line, so it can\'t be imported')
+        return False
+    try:
+        with open(v.file) as f:
+            text = f.read()
+    except OSError as e:
+        warn(f"{v.name}: can't read {v.file} ({e.strerror}); skipped")
+        return False
+    if "[Interface]" not in text or "[Peer]" not in text:
+        warn(f"{v.name}: {v.file} is not a WireGuard config; skipped")
+        return False
+    iface = interface_name_for(v.name, taken)
+    with tempfile.TemporaryDirectory() as tmp:
+        # NetworkManager names the new interface after the file, so copy it under that name.
+        path = os.path.join(tmp, f"{iface}.conf")
+        with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as f:
+            f.write(text)
+        out = run(["nmcli", "connection", "import", "type", "wireguard", "file", path])
+    m = re.search(r"\(([0-9a-f-]{36})\)", out)
+    if not m:
+        die(f"couldn't import {v.file}: {out}")
+    uuid = m.group(1)
+    run(["nmcli", "connection", "modify", "uuid", uuid,
+         "connection.id", v.name, "connection.autoconnect", "no"])
+    run(["nmcli", "connection", "down", "uuid", uuid], check=False)
+    taken.add(iface)
+    return True
+
+
+def configure(v, dry_run=False):
+    """Make a VPN's NetworkManager settings match its type. Returns what had to change."""
+    if v.kind == "internet":
+        # All DNS goes through this VPN while it's up.
+        want = {"ipv4.dns-search": "~.", "ipv4.dns-priority": "-50",
+                "ipv6.dns-search": "~.", "ipv6.dns-priority": "-50"}
+    else:
+        # Only its own addresses go through it: never take over DNS.
+        want = {"ipv4.dns": "", "ipv4.dns-search": "", "ipv6.dns": "", "ipv6.dns-search": "",
+                "connection.autoconnect": "yes" if v.autostart else "no"}
+    changes = [k for k, value in want.items() if nm_get(v.name, k) != value]
+    # Internet VPNs carry the game-bypass routing rule; company VPNs don't need it.
+    for family in ("ipv4", "ipv6"):
+        key = f"{family}.routing-rules"
+        if (BYPASS_MARK in nm_get(v.name, key)) != (v.kind == "internet"):
+            want[key] = BYPASS_RULE if v.kind == "internet" else ""
+            changes.append(key)
+    if changes and not dry_run:
+        args = []
+        for k in changes:
+            args += [k, want[k]]
+        run(["nmcli", "connection", "modify", "id", v.name, *args])
+    return changes
+
+
+# ---------------------------------------------------------------- generated files
+
+def nft_elements(set_name, items, quote=False):
+    if not items:
+        return []
+    values = ", ".join(f'"{i}"' if quote else i for i in items)
+    return [f"add element {TABLE} {set_name} {{ {values} }}"]
+
+
+def build_files(vpns):
+    """Work out the firewall, dnsmasq and resolved files from your settings."""
+    nm = nm_wireguard()
+    ifaces, dns4, dns6 = {"lo"}, set(), set()
+    for v in vpns:
+        if v.name not in nm:
+            continue
+        iface = nm_get(v.name, "connection.interface-name")
+        if iface:
+            ifaces.add(iface)
+        if v.kind == "internet":
+            for family, found in (("ipv4", dns4), ("ipv6", dns6)):
+                for server in re.split(r"[,\s|]+", nm_get(v.name, f"{family}.dns")):
+                    try:
+                        found.add(str(ipaddress.ip_address(server)))
+                    except ValueError:
+                        pass
+
+    on = killswitch_on()
+    domains, ranges4, ranges6 = load_list(VPN_ONLY_FILE) if on else ([], [], [])
+    bypass, bypass4, bypass6 = load_list(BYPASS_FILE)
+    both = sorted(set(bypass) & set(domains))
+    if both:
+        warn(f"on both lists, so the kill switch wins (not bypassed): {', '.join(both)}")
+        bypass = [d for d in bypass if d not in both]
+
+    rules = [f"# Generated by `vpn apply` from the files in {ETC}. Don't edit by hand."]
+    rules += nft_elements("vpn_ifaces", sorted(ifaces), quote=True)
+    rules += nft_elements("vpn_dns_v4", sorted(dns4))
+    rules += nft_elements("vpn_dns_v6", sorted(dns6))
+    rules += nft_elements("bypass_ranges_v4", bypass4)
+    rules += nft_elements("bypass_ranges_v6", bypass6)
+    rules += nft_elements("bypass_dns_v4", list(BYPASS_DNS))
+    if on:
+        rules += nft_elements("vpnonly_ranges_v4", ranges4)
+        rules += nft_elements("vpnonly_ranges_v6", ranges6)
+        for chain, lines in KILLSWITCH_RULES.items():
+            rules += [f"add rule {TABLE} {chain} {line}" for line in lines]
+    else:
+        rules.append("# The kill switch is OFF (vpn killswitch on).")
+
+    dnsmasq = [
+        "# Generated by `vpn apply`. Resolves only the listed domains: VPN-only domains",
+        "# only through the VPNs' own DNS servers, bypass domains through public DNS, and",
+        "# adds every answer to the matching firewall set.",
+        f"listen-address={DNSMASQ_ADDR}",
+        "bind-interfaces",
+        "no-resolv",
+        "no-hosts",
+        "no-poll",
+        "cache-size=0",
+        "user=dnsmasq",
+        "group=dnsmasq",
+    ]
+    if bypass:
+        # The normal connection has no IPv6 here but the VPN has, so an IPv6 answer would
+        # quietly send a bypass site through the VPN. Answer with IPv4 addresses only.
+        dnsmasq.append("filter-AAAA")
+    for d in domains:
+        dnsmasq += [f"server=/{d}/{s}" for s in sorted(dns4)]
+        dnsmasq.append(f"nftset=/{d}/4#inet#vpnsplit#vpnonly_v4,6#inet#vpnsplit#vpnonly_v6")
+    for d in bypass:
+        dnsmasq += [f"server=/{d}/{s}" for s in BYPASS_DNS]
+        dnsmasq.append(f"nftset=/{d}/4#inet#vpnsplit#bypass_v4,6#inet#vpnsplit#bypass_v6")
+
+    resolved = None
+    if domains or bypass:
+        resolved = "\n".join([
+            "# Generated by `vpn apply`: send lookups for the listed domains to vpn-dns.",
+            "[Resolve]",
+            f"DNS={DNSMASQ_ADDR}",
+            "Domains=" + " ".join(f"~{d}" for d in domains + bypass),
+        ]) + "\n"
+
+    if on and (domains or ranges4 or ranges6) and not dns4:
+        warn("no internet VPN with a DNS server is set up, so VPN-only domains can't be looked up at all")
+    summary = {"ifaces": sorted(ifaces), "domains": domains, "ranges": len(ranges4) + len(ranges6), "on": on,
+               "bypass": bypass, "bypass_ranges": len(bypass4) + len(bypass6)}
+    return "\n".join(rules) + "\n", "\n".join(dnsmasq) + "\n", resolved, summary
+
+
+def install_files(rules, dnsmasq, resolved):
+    """Check the new files, put them in place and reload the services."""
+    os.makedirs(GEN_DIR, exist_ok=True)
+    write(GEN_DNSMASQ + ".tmp", dnsmasq)
+    run(["dnsmasq", "--test", f"--conf-file={GEN_DNSMASQ}.tmp"])
+
+    # Keep the previous firewall file until the whole ruleset loads with the new one.
+    backup = GEN_RULES + ".bak" if os.path.exists(GEN_RULES) else None
+    if backup:
+        shutil.copy2(GEN_RULES, backup)
+    write(GEN_RULES, rules)
+    check = subprocess.run(["nft", "-c", "-f", FIREWALL_FILE], capture_output=True, text=True)
+    if check.returncode != 0:
+        if backup:
+            os.replace(backup, GEN_RULES)
+        else:
+            os.remove(GEN_RULES)
+        os.remove(GEN_DNSMASQ + ".tmp")
+        die("the firewall rules don't load with these settings, so nothing changed:\n" + check.stderr.strip())
+    if backup:
+        os.remove(backup)
+    os.replace(GEN_DNSMASQ + ".tmp", GEN_DNSMASQ)
+
+    run(["systemctl", "restart", "vpn-firewall.service"])   # reloads the rules (and vpn-dns with it)
+    run(["systemctl", "restart", "vpn-dns.service"])
+    # Point DNS for the VPN-only domains at vpn-dns only if it starts and stays up;
+    # otherwise those lookups would go to a dead server.
+    time.sleep(1)
+    unit_state = run(["systemctl", "show", "-p", "ActiveState", "--value", "vpn-dns.service"], check=False)
+    restarts = run(["systemctl", "show", "-p", "NRestarts", "--value", "vpn-dns.service"], check=False)
+    if unit_state != "active" or restarts != "0":
+        if os.path.exists(RESOLVED_DROPIN):
+            os.remove(RESOLVED_DROPIN)
+            run(["systemctl", "reload-or-restart", "systemd-resolved.service"], check=False)
+        die("vpn-dns (the private DNS server) doesn't stay up, so VPN-only domains were left on "
+            "normal DNS.\nSee: journalctl -u vpn-dns -b   and MANUAL.md section 8.2")
+    if resolved:
+        os.makedirs(os.path.dirname(RESOLVED_DROPIN), exist_ok=True)
+        write(RESOLVED_DROPIN, resolved)
+    elif os.path.exists(RESOLVED_DROPIN):
+        os.remove(RESOLVED_DROPIN)
+    run(["systemctl", "reload-or-restart", "systemd-resolved.service"])
+    run(["resolvectl", "flush-caches"], check=False)
+
+
+def refresh(vpns, dry_run=False):
+    rules, dnsmasq, resolved, summary = build_files(vpns)
+    if dry_run:
+        print(f"\n--- {GEN_RULES} ---\n{rules}\n--- {GEN_DNSMASQ} ---\n{dnsmasq}")
+        print(f"--- {RESOLVED_DROPIN} ---\n{resolved or '(removed: no VPN-only domains)'}")
+        with tempfile.NamedTemporaryFile("w", suffix=".conf") as t:
+            t.write(dnsmasq)
+            t.flush()
+            run(["dnsmasq", "--test", f"--conf-file={t.name}"])
+        print("(dry run: nothing was changed)")
+        return
+    install_files(rules, dnsmasq, resolved)
+    if summary["on"]:
+        print(f"Kill switch ON: {len(summary['domains'])} domains and {summary['ranges']} IP ranges "
+              f"only work through: {', '.join(i for i in summary['ifaces'] if i != 'lo')}")
+    else:
+        print("Kill switch OFF: everything on the VPN-only list works without a VPN.")
+    print(f"Bypass: {len(summary['bypass'])} domains and {summary['bypass_ranges']} IP ranges "
+          f"always skip the VPN.")
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_apply(args):
+    if not args.dry_run:
+        become_root()
+    vpns = load_vpns()
+    nm = nm_wireguard()
+    taken = set(os.listdir("/sys/class/net")) | {nm_get(n, "connection.interface-name") for n in nm}
+    print("VPNs:")
+    for v in vpns:
+        if v.name not in nm:
+            if args.dry_run:
+                print(f"  + {v.name}: would be imported from {v.file}")
+                continue
+            if not import_vpn(v, taken):
+                continue
+            nm[v.name] = False
+            print(f"  + {v.name}: imported from {v.file}")
+        changes = configure(v, dry_run=args.dry_run)
+        note = ""
+        if changes:
+            note = f" (would update {', '.join(changes)})" if args.dry_run else " (settings updated)"
+            if nm[v.name] and not args.dry_run:
+                iface = nm_get(v.name, "connection.interface-name")
+                if subprocess.run(["nmcli", "device", "reapply", iface], capture_output=True).returncode:
+                    note += "; reconnect it to use them"
+        if v.kind == "company" and v.autostart and not nm[v.name] and not args.dry_run:
+            run(["nmcli", "connection", "up", "id", v.name], check=False)
+            nm[v.name] = True
+        state = "up" if nm.get(v.name) else "off"
+        print(f"  ✓ {v.name}: {v.kind}, {state}{note}")
+    for name in nm:
+        if name not in {v.name for v in vpns}:
+            warn(f'"{name}" is in NetworkManager but not in {VPNS_FILE}, so it doesn\'t count as a VPN. '
+                 f'Add it there, or remove it with: nmcli connection delete "{name}"')
+    refresh(vpns, dry_run=args.dry_run)
+
+
+def cmd_use(args):
+    become_root()
+    vpns = load_vpns()
+    v = find_vpn(vpns, args.name)
+    if v.kind != "internet":
+        die(f'"{v.name}" is a company VPN. `vpn use` is for internet VPNs; company VPNs follow '
+            f'"autostart" in {VPNS_FILE}.')
+    nm = nm_wireguard()
+    if v.name not in nm:
+        print(f"{v.name} isn't imported yet; running `vpn apply` first.\n")
+        cmd_apply(argparse.Namespace(dry_run=False))
+        nm = nm_wireguard()
+        if v.name not in nm:
+            die(f"couldn't import {v.name}; see the messages above")
+    for other in vpns:
+        if other.kind == "internet" and other.name != v.name and other.name in nm:
+            if nm[other.name]:
+                run(["nmcli", "connection", "down", "id", other.name], check=False)
+            run(["nmcli", "connection", "modify", "id", other.name, "connection.autoconnect", "no"])
+    run(["nmcli", "connection", "modify", "id", v.name, "connection.autoconnect", "yes"])
+    run(["nmcli", "connection", "up", "id", v.name])
+    print(f"Now using {v.name}. It also starts at boot.")
+
+
+def cmd_off(args):
+    become_root()
+    vpns = load_vpns()
+    nm = nm_wireguard()
+    for v in vpns:
+        if v.kind == "internet" and v.name in nm:
+            if nm[v.name]:
+                run(["nmcli", "connection", "down", "id", v.name], check=False)
+            run(["nmcli", "connection", "modify", "id", v.name, "connection.autoconnect", "no"])
+    print("No internet VPN: plain internet, now and after a reboot. Company VPNs are unchanged.")
+    if killswitch_on():
+        print("The kill switch is ON, so everything on the VPN-only list is blocked until you run\n"
+              '`vpn use "<name>"` or `vpn killswitch off`.')
+
+
+def cmd_killswitch(args):
+    if args.state == "status":
+        print("Kill switch is " + ("ON" if killswitch_on() else "OFF"))
+        return
+    become_root()
+    if args.state == "off":
+        write(KILLSWITCH_OFF_FLAG, "The kill switch was turned off with `vpn killswitch off`.\n"
+                                   "Turn it back on with `vpn killswitch on`.\n")
+    elif os.path.exists(KILLSWITCH_OFF_FLAG):
+        os.remove(KILLSWITCH_OFF_FLAG)
+    refresh(load_vpns())
+    if args.state == "off":
+        print("It stays off, even after a reboot, until you run `vpn killswitch on`.")
+
+
+def cmd_status(args):
+    vpns = load_vpns()
+    nm = nm_wireguard()
+
+    def line(v):
+        if v.name not in nm:
+            return f"  ○ {v.name:<16} not imported yet (run: vpn apply)"
+        boot = ", starts at boot" if nm_get(v.name, "connection.autoconnect") == "yes" else ""
+        return f"  {'●' if nm[v.name] else '○'} {v.name:<16} {'UP' if nm[v.name] else 'off'}{boot}"
+
+    internet = [v for v in vpns if v.kind == "internet"]
+    company = [v for v in vpns if v.kind == "company"]
+    print('Internet VPNs (one at a time; switch with: vpn use "<name>")')
+    print("\n".join(line(v) for v in internet) or "  (none listed)")
+    if not any(nm.get(v.name) for v in internet):
+        print("  → no internet VPN is up: plain internet")
+    print("Company VPNs")
+    print("\n".join(line(v) for v in company) or "  (none listed)")
+
+    domains, r4, r6 = load_list(VPN_ONLY_FILE)
+    if killswitch_on():
+        print(f"Kill switch    ON: {len(domains)} domains and {len(r4) + len(r6)} IP ranges only work "
+              f"through a VPN ({VPN_ONLY_FILE})")
+    else:
+        print("Kill switch    OFF ⚠  the VPN-only list works without a VPN (turn on: vpn killswitch on)")
+    bypass, b4, b6 = load_list(BYPASS_FILE)
+    print(f"Bypass list    {len(bypass)} domains and {len(b4) + len(b6)} IP ranges always skip the VPN "
+          f"({BYPASS_FILE})")
+    print("Game bypass    apps started with `novpn` skip the VPN (Steam: novpn %command%)")
+    services = [f"{s} {run(['systemctl', 'is-active', s + '.service'], check=False)}"
+                for s in ("vpn-firewall", "vpn-dns")]
+    print("Services       " + ", ".join(services))
+    print(f"Manual         {MANUAL}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="vpn",
+        description="Manage the WireGuard VPNs, the kill switch and the game bypass.",
+        epilog=f"Settings: {VPNS_FILE}, {VPN_ONLY_FILE}, {BYPASS_FILE}. Manual: {MANUAL}")
+    sub = parser.add_subparsers(dest="command", metavar="command")
+    sub.add_parser("status", help="show the VPNs and the kill switch (the default)")
+    use = sub.add_parser("use", help="switch to an internet VPN; it also becomes the one that starts at boot")
+    use.add_argument("name", help='the VPN\'s name in /etc/vpn/vpns, e.g. "USA VPN"')
+    sub.add_parser("off", help="turn the internet VPN off (plain internet, also after a reboot)")
+    ks = sub.add_parser("killswitch", help="turn the kill switch on or off")
+    ks.add_argument("state", nargs="?", choices=["on", "off", "status"], default="status")
+    apply = sub.add_parser("apply", help="apply your changes to the files in /etc/vpn")
+    apply.add_argument("--dry-run", action="store_true", help="show what would happen; change nothing")
+    sub.add_parser("help", help="show this help")
+    args = parser.parse_args()
+
+    commands = {"status": cmd_status, "use": cmd_use, "off": cmd_off,
+                "killswitch": cmd_killswitch, "apply": cmd_apply}
+    if args.command == "help":
+        parser.print_help()
+    else:
+        commands.get(args.command or "status")(args)
+
+
+if __name__ == "__main__":
+    main()
