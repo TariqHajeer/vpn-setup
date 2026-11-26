@@ -355,7 +355,30 @@ def build_files(vpns):
     return "\n".join(rules) + "\n", "\n".join(dnsmasq) + "\n", resolved, summary
 
 
-def install_files(rules, dnsmasq, resolved):
+def restart_resolver(vpn_links=()):
+    """Restart systemd-resolved so it reads its config afresh, then have NetworkManager
+    hand it the VPNs' DNS settings again.
+
+    A *reload* of systemd-resolved adds domains from its config but never drops ones
+    that were removed: a domain taken off a list kept going to vpn-dns, which then
+    refused it. A restart also forgets NetworkManager's per-connection DNS, hence
+    "nmcli general reload dns-full". vpn_links: (name, interface) of the VPNs that are up.
+    """
+    run(["systemctl", "restart", "systemd-resolved.service"])
+    run(["nmcli", "general", "reload", "dns-full"], check=False)
+    run(["resolvectl", "flush-caches"], check=False)
+    for name, iface in vpn_links:
+        for _ in range(10):   # up to 5 seconds
+            servers = run(["resolvectl", "dns", iface], check=False).partition(":")[2].strip()
+            if servers:
+                break
+            time.sleep(0.5)
+        else:
+            warn(f'{name} has no DNS server after restarting the resolver. If names stop '
+                 f'resolving, run: nmcli connection up "{name}"')
+
+
+def install_files(rules, dnsmasq, resolved, vpn_links=()):
     """Check the new files, put them in place and reload the services."""
     os.makedirs(GEN_DIR, exist_ok=True)
     write(GEN_DNSMASQ + ".tmp", dnsmasq)
@@ -388,16 +411,15 @@ def install_files(rules, dnsmasq, resolved):
     if unit_state != "active" or restarts != "0":
         if os.path.exists(RESOLVED_DROPIN):
             os.remove(RESOLVED_DROPIN)
-            run(["systemctl", "reload-or-restart", "systemd-resolved.service"], check=False)
-        die("vpn-dns (the private DNS server) doesn't stay up, so VPN-only domains were left on "
+            restart_resolver(vpn_links)
+        die("vpn-dns (the private DNS server) doesn't stay up, so the listed domains were left on "
             "normal DNS.\nSee: journalctl -u vpn-dns -b   and MANUAL.md section 8.2")
     if resolved:
         os.makedirs(os.path.dirname(RESOLVED_DROPIN), exist_ok=True)
         write(RESOLVED_DROPIN, resolved)
     elif os.path.exists(RESOLVED_DROPIN):
         os.remove(RESOLVED_DROPIN)
-    run(["systemctl", "reload-or-restart", "systemd-resolved.service"])
-    run(["resolvectl", "flush-caches"], check=False)
+    restart_resolver(vpn_links)
 
 
 def refresh(vpns, dry_run=False):
@@ -411,7 +433,10 @@ def refresh(vpns, dry_run=False):
             run(["dnsmasq", "--test", f"--conf-file={t.name}"])
         print("(dry run: nothing was changed)")
         return
-    install_files(rules, dnsmasq, resolved)
+    nm = nm_wireguard()
+    vpn_links = [(v.name, nm_get(v.name, "connection.interface-name"))
+                 for v in vpns if v.kind == "internet" and nm.get(v.name)]
+    install_files(rules, dnsmasq, resolved, vpn_links)
     if summary["on"]:
         print(f"Kill switch ON: {len(summary['domains'])} domains and {summary['ranges']} IP ranges "
               f"only work through: {', '.join(i for i in summary['ifaces'] if i != 'lo')}")

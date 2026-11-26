@@ -13,7 +13,10 @@ fi
 
 echo "==> DNS back to normal"
 sudo rm -f /etc/systemd/resolved.conf.d/vpn.conf
-sudo systemctl reload-or-restart systemd-resolved.service
+# A restart (not a reload) so the resolver really forgets the routed domains; then
+# NetworkManager hands it the VPNs' DNS settings again.
+sudo systemctl restart systemd-resolved.service
+sudo nmcli general reload dns-full || true
 
 echo "==> Services and firewall rules"
 sudo systemctl disable --now vpn-dns.service vpn-firewall.service 2>/dev/null || true
